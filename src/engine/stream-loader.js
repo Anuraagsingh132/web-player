@@ -14,7 +14,12 @@ export class RangeStreamLoader {
     this.acceptsRanges = false;
     this.contentType = '';
     this.streamUrl = '';
-    this.chunkCache = new Map(); // Small LRU cache for frequently read headers
+    
+    // High-performance 2MB block buffer for full bandwidth saturation
+    this.blockSize = 2 * 1024 * 1024; // 2 MB blocks
+    this.blockCache = new Map();
+    this.inFlightRequests = new Map();
+    this.maxCachedBlocks = 24; // ~48 MB sliding window
   }
 
   /**
@@ -87,32 +92,95 @@ export class RangeStreamLoader {
   }
 
   /**
-   * Fetches only a specific byte range (e.g. 0 to 2MB for header metadata)
+   * Fetches an aligned 2MB block from the network or memory cache
+   */
+  async fetchBlock(blockIndex) {
+    if (this.blockCache.has(blockIndex)) {
+      return this.blockCache.get(blockIndex);
+    }
+
+    if (this.inFlightRequests.has(blockIndex)) {
+      return this.inFlightRequests.get(blockIndex);
+    }
+
+    const start = blockIndex * this.blockSize;
+    if (this.totalSize > 0 && start >= this.totalSize) {
+      return new Uint8Array(0);
+    }
+
+    const end = Math.min(
+      start + this.blockSize - 1,
+      this.totalSize > 0 ? this.totalSize - 1 : start + this.blockSize - 1
+    );
+
+    const promise = (async () => {
+      try {
+        const res = await fetch(this.streamUrl, {
+          headers: { Range: `bytes=${start}-${end}` }
+        });
+
+        if (!res.ok && res.status !== 206) {
+          throw new Error(`HTTP ${res.status} fetching block ${blockIndex} (${start}-${end})`);
+        }
+
+        const buffer = await res.arrayBuffer();
+        const data = new Uint8Array(buffer);
+
+        // Manage sliding window memory buffer (max 24 blocks = 48MB)
+        if (this.blockCache.size >= this.maxCachedBlocks) {
+          const oldestKey = this.blockCache.keys().next().value;
+          this.blockCache.delete(oldestKey);
+        }
+
+        this.blockCache.set(blockIndex, data);
+        return data;
+      } finally {
+        this.inFlightRequests.delete(blockIndex);
+      }
+    })();
+
+    this.inFlightRequests.set(blockIndex, promise);
+    return promise;
+  }
+
+  /**
+   * Asynchronously prefetches upcoming blocks in the background
+   */
+  prefetch(blockIndex) {
+    if (this.totalSize > 0 && blockIndex * this.blockSize >= this.totalSize) return;
+    if (this.blockCache.has(blockIndex) || this.inFlightRequests.has(blockIndex)) return;
+    this.fetchBlock(blockIndex).catch(() => {});
+  }
+
+  /**
+   * Fast byte range read from memory block cache with automatic prefetching
    */
   async readRange(start, end) {
-    const cacheKey = `${start}-${end}`;
-    if (this.chunkCache.has(cacheKey)) {
-      return this.chunkCache.get(cacheKey);
+    const totalBytesNeeded = Math.max(0, end - start + 1);
+    const result = new Uint8Array(totalBytesNeeded);
+    let bytesFilled = 0;
+
+    const startBlock = Math.floor(start / this.blockSize);
+    const endBlock = Math.floor(end / this.blockSize);
+
+    // Concurrently prefetch ahead (next 2 blocks = 4MB ahead)
+    this.prefetch(endBlock + 1);
+    this.prefetch(endBlock + 2);
+
+    for (let b = startBlock; b <= endBlock; b++) {
+      const blockData = await this.fetchBlock(b);
+      const blockStartByte = b * this.blockSize;
+
+      const sliceStart = Math.max(0, start - blockStartByte);
+      const sliceEnd = Math.min(blockData.length, end - blockStartByte + 1);
+
+      if (sliceStart < blockData.length && sliceEnd > sliceStart) {
+        const chunk = blockData.subarray(sliceStart, sliceEnd);
+        result.set(chunk, bytesFilled);
+        bytesFilled += chunk.length;
+      }
     }
 
-    const res = await fetch(this.streamUrl, {
-      headers: { Range: `bytes=${start}-${end}` }
-    });
-
-    if (!res.ok && res.status !== 206) {
-      throw new Error(`Failed to read byte range ${start}-${end}: HTTP ${res.status}`);
-    }
-
-    const buffer = await res.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-
-    // Keep small cache (max 10 entries)
-    if (this.chunkCache.size > 10) {
-      const firstKey = this.chunkCache.keys().next().value;
-      this.chunkCache.delete(firstKey);
-    }
-    this.chunkCache.set(cacheKey, bytes);
-
-    return bytes;
+    return result.subarray(0, bytesFilled);
   }
 }

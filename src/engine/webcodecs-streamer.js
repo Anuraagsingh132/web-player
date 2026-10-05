@@ -252,6 +252,8 @@ export class WebCodecsStreamer {
   play() {
     if (this.isPlaying) return;
     this.isPlaying = true;
+    this.playbackStartWallTime = performance.now();
+    this.playbackStartMediaTime = this.currentTime || 0;
     if (this.onStateChange) this.onStateChange('playing');
 
     this.startDemuxLoop();
@@ -260,6 +262,10 @@ export class WebCodecsStreamer {
 
   pause() {
     this.isPlaying = false;
+    if (this.playbackStartWallTime) {
+      const elapsed = (performance.now() - this.playbackStartWallTime) / 1000;
+      this.playbackStartMediaTime += elapsed;
+    }
     if (this.onStateChange) this.onStateChange('paused');
     if (this.renderLoopId) cancelAnimationFrame(this.renderLoopId);
   }
@@ -267,6 +273,8 @@ export class WebCodecsStreamer {
   stop() {
     this.pause();
     this.currentTime = 0;
+    this.playbackStartMediaTime = 0;
+    this.playbackStartWallTime = 0;
     while (this.videoFrameQueue.length > 0) {
       const f = this.videoFrameQueue.shift();
       f.close();
@@ -285,11 +293,11 @@ export class WebCodecsStreamer {
 
     try {
       while (this.isPlaying && this.fmt_ctx) {
-        // Demux next packets using modern ff_read_frame_multi (replaces deprecated ff_read_multi)
+        // Demux in fast 512KB bursts to saturate decoder pipeline
         const [res, packets] = await this.libav.ff_read_frame_multi(
           this.fmt_ctx,
           this.demuxPkt,
-          { limit: 32 * 1024 }
+          { limit: 512 * 1024 }
         );
 
         if (res === this.libav.AVERROR_EOF) break;
@@ -339,9 +347,9 @@ export class WebCodecsStreamer {
           }
         }
 
-        // Throttle demux loop if queue is full (buffer ~60 frames ahead)
-        if (this.videoFrameQueue.length > 60) {
-          await new Promise(r => setTimeout(r, 200));
+        // Keep 90 frames (~3.5 seconds) buffered in queue, then rest briefly
+        if (this.videoFrameQueue.length > 90) {
+          await new Promise(r => setTimeout(r, 60));
         }
       }
     } catch (err) {
@@ -432,31 +440,22 @@ export class WebCodecsStreamer {
   }
 
   startRenderLoop() {
-    let lastTime = performance.now();
-    let clock = this.currentTime || 0;
-
     const render = (now) => {
       if (!this.isPlaying) return;
 
-      const dt = (now - lastTime) / 1000;
-      lastTime = now;
-      clock += dt;
-
-      // Sync target timestamp with Web Audio or Wall clock
-      let targetTime = clock;
-      if (this.audioEngine && this.audioEngine.ctx && this.audioEngine.nextChunkTime) {
-        targetTime = Math.max(0, this.audioEngine.ctx.currentTime);
-      }
+      const elapsedSec = (now - this.playbackStartWallTime) / 1000;
+      const targetTime = (this.playbackStartMediaTime || 0) + elapsedSec;
 
       while (this.videoFrameQueue.length > 0) {
         const frame = this.videoFrameQueue[0];
         const frameSec = (frame.timestamp || 0) / 1000000;
 
-        // If frame is in the future (>35ms), wait for next RAF tick
-        if (frameSec > targetTime + 0.035 && this.videoFrameQueue.length < 30) {
+        // If frame is in the future (>15ms ahead), wait for next frame tick
+        if (frameSec > targetTime + 0.015) {
           break;
         }
 
+        // It is time to render this frame!
         this.videoFrameQueue.shift();
         this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
         this.currentTime = frameSec;
@@ -466,8 +465,8 @@ export class WebCodecsStreamer {
           this.onTimeUpdate(this.currentTime, this.duration);
         }
 
-        // Render one frame per RAF tick unless catching up
-        if (frameSec >= targetTime - 0.05) {
+        // Present one frame per RAF tick unless catching up from lag
+        if (frameSec >= targetTime - 0.035) {
           break;
         }
       }
@@ -475,8 +474,6 @@ export class WebCodecsStreamer {
       this.renderLoopId = requestAnimationFrame(render);
     };
 
-    lastTime = performance.now();
-    clock = this.currentTime || 0;
     this.renderLoopId = requestAnimationFrame(render);
   }
 }
