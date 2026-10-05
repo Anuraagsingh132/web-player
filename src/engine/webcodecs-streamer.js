@@ -53,6 +53,7 @@ export class WebCodecsStreamer {
     this.videoFrameQueue = [];
     this.renderLoopId = null;
     this.demuxLoopRunning = false;
+    this.starvationStartTime = 0;
 
     // Hooks
     this.onTimeUpdate = null;
@@ -96,7 +97,7 @@ export class WebCodecsStreamer {
     this.libav.onblockread = async (name, pos, length) => {
       try {
         this.loader.updatePlaybackPosition(pos);
-        const readLen = Math.min(length || 64 * 1024, (this.totalSize ? this.totalSize - pos : 128 * 1024));
+        const readLen = Math.min(Math.max(length || 0, 128 * 1024), (this.totalSize ? this.totalSize - pos : 128 * 1024));
         const bytes = await this.loader.readRange(pos, pos + readLen - 1);
         await this.libav.ff_block_reader_dev_send(name, pos, bytes);
       } catch (err) {
@@ -310,6 +311,7 @@ export class WebCodecsStreamer {
       try { this.audioEngine.ctx.resume(); } catch (e) {}
     }
     this.isPlaying = true;
+    this.starvationStartTime = 0;
     this.playbackStartWallTime = performance.now();
     this.playbackStartMediaTime = this.currentTime || 0;
     if (this.audioEngine) {
@@ -323,6 +325,7 @@ export class WebCodecsStreamer {
 
   pause() {
     this.isPlaying = false;
+    this.starvationStartTime = 0;
     if (this.playbackStartWallTime) {
       const elapsed = (performance.now() - this.playbackStartWallTime) / 1000;
       this.playbackStartMediaTime += elapsed;
@@ -339,6 +342,7 @@ export class WebCodecsStreamer {
     this.currentTime = 0;
     this.playbackStartMediaTime = 0;
     this.playbackStartWallTime = 0;
+    this.starvationStartTime = 0;
     while (this.videoFrameQueue.length > 0) {
       const f = this.videoFrameQueue.shift();
       f.close();
@@ -439,12 +443,12 @@ export class WebCodecsStreamer {
           }
         }
 
-        // Maintain a smooth buffer (60-90 frames) while yielding CPU to the browser network process
-        if (this.videoFrameQueue.length > 70 || (this.videoDecoder && this.videoDecoder.decodeQueueSize > 10)) {
-          await new Promise(r => setTimeout(r, 50));
+        // Maintain a smooth buffer (20-30 frames) while yielding CPU to the browser network process
+        if (this.videoFrameQueue.length > 25 || (this.videoDecoder && this.videoDecoder.decodeQueueSize > 12)) {
+          await new Promise(r => setTimeout(r, 20));
         } else {
-          // Always yield to macro event loop so network downloads run at full speed without queuing
-          await new Promise(r => setTimeout(r, 10));
+          // Zero-delay yield to allow event loop and parallel network fetch
+          await new Promise(r => setTimeout(r, 0));
         }
       }
     } catch (err) {
@@ -485,10 +489,7 @@ export class WebCodecsStreamer {
       }
 
       const now = this.audioEngine.ctx.currentTime;
-      let when = this.audioEngine.nextChunkTime;
-      if (!when || when < now || (when - now > 1.0)) {
-        when = now + 0.05;
-      }
+      let when = Math.max(now + 0.02, this.audioEngine.nextChunkTime || (now + 0.02));
       src.start(when);
       this.audioEngine.nextChunkTime = when + buffer.duration;
     } catch (err) {
@@ -552,13 +553,18 @@ export class WebCodecsStreamer {
       }
 
       if (this.videoFrameQueue.length === 0) {
-        // Buffering/Waiting: anchor timeline to avoid clock drift
-        this.playbackStartWallTime = now;
-        this.playbackStartMediaTime = this.currentTime || 0;
+        if (!this.starvationStartTime) {
+          this.starvationStartTime = now;
+        } else if (now - this.starvationStartTime > 200) {
+          // Prolonged stall / network buffering: anchor timeline to pause clock
+          this.playbackStartWallTime = now;
+          this.playbackStartMediaTime = this.currentTime || 0;
+        }
         this.renderLoopId = requestAnimationFrame(render);
         return;
       }
 
+      this.starvationStartTime = 0;
       const targetTime = this.playbackStartMediaTime + (now - this.playbackStartWallTime) / 1000;
 
       while (this.videoFrameQueue.length > 0) {

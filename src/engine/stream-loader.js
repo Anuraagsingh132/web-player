@@ -17,8 +17,8 @@ export class RangeStreamLoader {
     
     // High-speed block engine (30s to 1 min forward preload)
     this.blockSize = 2 * 1024 * 1024; // 2 MB per block
-    this.targetAheadBlocks = 25; // 50 MB preload ahead (~30 to 45 seconds of 4K video)
-    this.maxCachedBlocks = 50; // ~100 MB RAM sliding window
+    this.targetAheadBlocks = 30; // 60 MB preload ahead (~30 to 50 seconds of 4K video)
+    this.maxCachedBlocks = 60; // ~120 MB RAM sliding window
     this.blockCache = new Map(); // blockIndex -> Uint8Array
     this.inFlightRequests = new Map(); // blockIndex -> Promise<Uint8Array>
 
@@ -115,36 +115,37 @@ export class RangeStreamLoader {
   }
 
   async runForwardBufferLoop() {
+    const concurrency = 3; // Maximize bandwidth saturation with parallel block downloads
     while (this.isForwardBuffering) {
       const currentBlock = Math.floor(this.currentPlaybackByte / this.blockSize);
       const targetBlock = currentBlock + this.targetAheadBlocks;
       const totalBlocks = this.totalSize > 0 ? Math.ceil(this.totalSize / this.blockSize) : targetBlock + 1;
 
-      // Find the next block that is missing in our forward window
-      let nextBlockToFetch = -1;
+      // Find up to `concurrency` blocks that are missing in our forward window
+      const blocksToFetch = [];
       for (let b = currentBlock; b <= Math.min(targetBlock, totalBlocks - 1); b++) {
         if (!this.blockCache.has(b) && !this.inFlightRequests.has(b)) {
-          nextBlockToFetch = b;
-          break;
+          blocksToFetch.push(b);
+          if (blocksToFetch.length >= concurrency) break;
         }
       }
 
-      if (nextBlockToFetch !== -1) {
+      if (blocksToFetch.length > 0) {
         try {
-          await this.fetchBlock(nextBlockToFetch);
+          await Promise.all(blocksToFetch.map(b => this.fetchBlock(b)));
           if (this.onBufferUpdate) {
             this.onBufferUpdate(this.getBufferedStats(currentBlock));
           }
         } catch (err) {
-          console.warn('[RangeStreamLoader] Forward buffer error for block', nextBlockToFetch, err.message);
-          await new Promise(r => setTimeout(r, 400));
+          console.warn('[RangeStreamLoader] Forward buffer download warning:', err.message);
+          await new Promise(r => setTimeout(r, 200));
         }
       } else {
         // Buffer ahead target is fully satisfied! Sleep briefly and monitor playback
         if (this.onBufferUpdate) {
           this.onBufferUpdate(this.getBufferedStats(currentBlock));
         }
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise(r => setTimeout(r, 150));
       }
     }
   }
