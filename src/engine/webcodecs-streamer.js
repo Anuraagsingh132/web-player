@@ -546,6 +546,11 @@ export class WebCodecsStreamer {
     const render = (now) => {
       if (!this.isPlaying) return;
 
+      if (!this.playbackStartWallTime) {
+        this.playbackStartWallTime = now;
+        this.playbackStartMediaTime = this.currentTime || 0;
+      }
+
       if (this.videoFrameQueue.length === 0) {
         // Buffering/Waiting: anchor timeline to avoid clock drift
         this.playbackStartWallTime = now;
@@ -553,6 +558,8 @@ export class WebCodecsStreamer {
         this.renderLoopId = requestAnimationFrame(render);
         return;
       }
+
+      const targetTime = this.playbackStartMediaTime + (now - this.playbackStartWallTime) / 1000;
 
       while (this.videoFrameQueue.length > 0) {
         const frame = this.videoFrameQueue[0];
