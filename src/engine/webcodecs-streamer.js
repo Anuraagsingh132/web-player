@@ -105,7 +105,14 @@ export class WebCodecsStreamer {
     };
 
     if (this.videoStream) {
-      const vConfig = Bridge.videoStreamToConfig(this.videoStream);
+      console.log('[WebCodecsStreamer] Converting video stream to WebCodecs config with LibAV...');
+      const vConfig = await Bridge.videoStreamToConfig(this.libav, this.videoStream);
+      console.log('[WebCodecsStreamer] Bridge video config:', vConfig);
+
+      if (!vConfig || !vConfig.codec) {
+        throw new Error('Could not extract valid WebCodecs video configuration from stream.');
+      }
+
       this.canvas.width = vConfig.codedWidth || 1920;
       this.canvas.height = vConfig.codedHeight || 1080;
 
@@ -121,19 +128,27 @@ export class WebCodecsStreamer {
     }
 
     if (this.audioStream) {
-      await this.audioEngine.init();
-      // Setup audio decoder (WASM software decoder for AC-3/E-AC-3)
-      const [, c, p, f] = await this.libav.ff_init_decoder(this.audioStream.codec_id, this.audioStream.codecpar);
-      this.audioCodecCtx = c;
-      this.audioPkt = p;
-      this.audioFrame = f;
+      try {
+        await this.audioEngine.init();
+        let audioCodecName = 'Audio';
+        try {
+          audioCodecName = await this.libav.avcodec_get_name(this.audioStream.codec_id);
+        } catch (e) {}
 
-      this.metadata.audioTracks.push({
-        codec: 'E-AC-3 / Dolby Digital Plus (Atmos)',
-        channels: this.audioStream.channels || 6,
-        channelLayout: '5.1 Surround',
-        sampleRate: `${this.audioStream.sample_rate || 48000} Hz`
-      });
+        const [, c, p, f] = await this.libav.ff_init_decoder(this.audioStream.codec_id, this.audioStream.codecpar);
+        this.audioCodecCtx = c;
+        this.audioPkt = p;
+        this.audioFrame = f;
+
+        this.metadata.audioTracks.push({
+          codec: (audioCodecName || 'Dolby Audio').toUpperCase(),
+          channels: this.audioStream.channels || 6,
+          channelLayout: (this.audioStream.channels === 6) ? '5.1 Surround' : 'Stereo',
+          sampleRate: `${this.audioStream.sample_rate || 48000} Hz`
+        });
+      } catch (err) {
+        console.warn('[WebCodecsStreamer] Audio decoder initialization warning:', err);
+      }
     }
 
     if (this.onMetadataLoaded) this.onMetadataLoaded(this.metadata);
@@ -141,8 +156,41 @@ export class WebCodecsStreamer {
   }
 
   async initVideoDecoder(config) {
-    const isSupported = await VideoDecoder.isConfigSupported(config);
-    console.log('[WebCodecsStreamer] VideoDecoder support check:', isSupported);
+    if (!config || !config.codec) {
+      throw new Error('VideoDecoder requires a valid codec configuration.');
+    }
+
+    console.log('[WebCodecsStreamer] Initializing VideoDecoder with config:', config);
+
+    // Candidates to test with VideoDecoder
+    const candidateConfigs = [
+      { ...config },
+      config.description ? { ...config, description: undefined } : null,
+      config.codec.startsWith('hev1') ? { ...config, codec: config.codec.replace('hev1', 'hvc1') } : null,
+      config.codec.startsWith('hvc1') ? { ...config, codec: config.codec.replace('hvc1', 'hev1') } : null,
+      (config.codec.includes('hev') || config.codec.includes('hvc')) ? { ...config, codec: 'hvc1.2.4.L153.B0', description: undefined } : null,
+      (config.codec.includes('hev') || config.codec.includes('hvc')) ? { ...config, codec: 'hev1.2.4.L153.B0', description: undefined } : null,
+      (config.codec.includes('hev') || config.codec.includes('hvc')) ? { ...config, codec: 'hvc1.1.6.L93.B0', description: undefined } : null
+    ].filter(Boolean);
+
+    let chosenConfig = null;
+    for (const cand of candidateConfigs) {
+      try {
+        const check = await VideoDecoder.isConfigSupported(cand);
+        if (check && check.supported) {
+          chosenConfig = cand;
+          console.log('[WebCodecsStreamer] Confirmed supported VideoDecoder config:', cand.codec);
+          break;
+        }
+      } catch (e) {
+        // Try next candidate
+      }
+    }
+
+    if (!chosenConfig) {
+      console.warn('[WebCodecsStreamer] No exact config reported supported, trying best match:', config.codec);
+      chosenConfig = config;
+    }
 
     this.videoDecoder = new VideoDecoder({
       output: (frame) => {
@@ -153,7 +201,8 @@ export class WebCodecsStreamer {
       }
     });
 
-    this.videoDecoder.configure(config);
+    this.videoDecoder.configure(chosenConfig);
+    console.log('[WebCodecsStreamer] VideoDecoder configured successfully.');
   }
 
   play() {
@@ -200,24 +249,32 @@ export class WebCodecsStreamer {
         if (this.videoStream && packets[this.videoStream.index]) {
           for (const pkt of packets[this.videoStream.index]) {
             if (this.videoDecoder && this.videoDecoder.state === 'configured') {
-              const chunk = Bridge.packetToEncodedVideoChunk(pkt, this.videoStream);
-              this.videoDecoder.decode(chunk);
+              try {
+                const chunk = Bridge.packetToEncodedVideoChunk(pkt, this.videoStream);
+                this.videoDecoder.decode(chunk);
+              } catch (e) {
+                console.warn('[WebCodecsStreamer] Video packet decode warning:', e);
+              }
             }
           }
         }
 
         // Process Audio Packets
         if (this.audioStream && packets[this.audioStream.index] && this.audioCodecCtx) {
-          const frames = await this.libav.ff_decode_multi(
-            this.audioCodecCtx,
-            this.audioPkt,
-            this.audioFrame,
-            packets[this.audioStream.index],
-            false
-          );
+          try {
+            const frames = await this.libav.ff_decode_multi(
+              this.audioCodecCtx,
+              this.audioPkt,
+              this.audioFrame,
+              packets[this.audioStream.index],
+              false
+            );
 
-          for (const f of frames) {
-            this.scheduleAudioFrame(f);
+            for (const f of frames) {
+              this.scheduleAudioFrame(f);
+            }
+          } catch (e) {
+            console.warn('[WebCodecsStreamer] Audio decode warning:', e);
           }
         }
 
@@ -234,29 +291,47 @@ export class WebCodecsStreamer {
   }
 
   scheduleAudioFrame(f) {
-    if (!this.audioEngine.ctx) return;
-    const channels = f.channels || 6;
+    if (!this.audioEngine || !this.audioEngine.ctx) return;
+    const channels = f.channels || 2;
     const sampleRate = f.sample_rate || 48000;
     const nbSamples = f.nb_samples || 1024;
 
-    const buffer = this.audioEngine.ctx.createBuffer(channels, nbSamples, sampleRate);
-    for (let ch = 0; ch < channels; ch++) {
-      if (f.data[ch]) {
-        buffer.copyToChannel(f.data[ch], ch);
+    try {
+      const buffer = this.audioEngine.ctx.createBuffer(channels, nbSamples, sampleRate);
+      if (Array.isArray(f.data)) {
+        // Planar audio
+        for (let ch = 0; ch < channels; ch++) {
+          if (f.data[ch]) {
+            const channelData = f.data[ch] instanceof Float32Array ? f.data[ch] : new Float32Array(f.data[ch]);
+            buffer.copyToChannel(channelData, ch);
+          }
+        }
+      } else if (f.data) {
+        // Interleaved audio
+        const flatData = f.data instanceof Float32Array ? f.data : new Float32Array(f.data);
+        for (let ch = 0; ch < channels; ch++) {
+          const chArray = new Float32Array(nbSamples);
+          for (let i = 0; i < nbSamples; i++) {
+            chArray[i] = flatData[i * channels + ch] || 0;
+          }
+          buffer.copyToChannel(chArray, ch);
+        }
       }
-    }
 
-    const src = this.audioEngine.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(this.audioEngine.masterGain);
-    if (this.audioEngine.splitter) {
-      src.connect(this.audioEngine.splitter);
-    }
+      const src = this.audioEngine.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this.audioEngine.masterGain);
+      if (this.audioEngine.splitter) {
+        src.connect(this.audioEngine.splitter);
+      }
 
-    const now = this.audioEngine.ctx.currentTime;
-    const when = Math.max(now, this.audioEngine.nextChunkTime || now);
-    src.start(when);
-    this.audioEngine.nextChunkTime = when + buffer.duration;
+      const now = this.audioEngine.ctx.currentTime;
+      const when = Math.max(now, this.audioEngine.nextChunkTime || now);
+      src.start(when);
+      this.audioEngine.nextChunkTime = when + buffer.duration;
+    } catch (err) {
+      console.warn('[WebCodecsStreamer] Audio scheduling warning:', err);
+    }
   }
 
   startRenderLoop() {
