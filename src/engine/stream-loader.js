@@ -149,6 +149,7 @@ export class RangeStreamLoader {
   prefetch(blockIndex) {
     if (this.totalSize > 0 && blockIndex * this.blockSize >= this.totalSize) return;
     if (this.blockCache.has(blockIndex) || this.inFlightRequests.has(blockIndex)) return;
+    if (this.inFlightRequests.size >= 2) return; // Keep maximum 2 concurrent requests
     this.fetchBlock(blockIndex).catch(() => {});
   }
 
@@ -163,9 +164,8 @@ export class RangeStreamLoader {
     const startBlock = Math.floor(start / this.blockSize);
     const endBlock = Math.floor(end / this.blockSize);
 
-    // Concurrently prefetch ahead (next 2 blocks = 4MB ahead)
+    // Smoothly prefetch the next block ahead
     this.prefetch(endBlock + 1);
-    this.prefetch(endBlock + 2);
 
     for (let b = startBlock; b <= endBlock; b++) {
       const blockData = await this.fetchBlock(b);

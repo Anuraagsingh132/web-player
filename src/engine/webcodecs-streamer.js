@@ -347,9 +347,12 @@ export class WebCodecsStreamer {
           }
         }
 
-        // Keep 90 frames (~3.5 seconds) buffered in queue, then rest briefly
-        if (this.videoFrameQueue.length > 90) {
-          await new Promise(r => setTimeout(r, 60));
+        // Maintain a smooth buffer (60-90 frames) while yielding CPU to the browser network process
+        if (this.videoFrameQueue.length > 70 || (this.videoDecoder && this.videoDecoder.decodeQueueSize > 10)) {
+          await new Promise(r => setTimeout(r, 50));
+        } else {
+          // Always yield to macro event loop so network downloads run at full speed without queuing
+          await new Promise(r => setTimeout(r, 10));
         }
       }
     } catch (err) {

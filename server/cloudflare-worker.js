@@ -40,29 +40,35 @@ export default {
     }
 
     try {
-      // Forward HTTP Range and headers
+      // Forward HTTP Range and headers with identity encoding (no compression overhead)
       const forwardHeaders = new Headers();
       forwardHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+      forwardHeaders.set('Accept-Encoding', 'identity');
 
       const rangeHeader = request.headers.get('range');
       if (rangeHeader) {
         forwardHeaders.set('Range', rangeHeader);
       }
 
-      // Fetch upstream bytes from Cloudflare R2 / target URL
+      // Fetch upstream bytes with edge caching enabled for range chunks
       const upstream = await fetch(targetUrl, {
         method: request.method,
         headers: forwardHeaders,
         redirect: 'follow',
+        cf: {
+          cacheEverything: true,
+          cacheTtl: 86400,
+        },
       });
 
-      // Prepare response with full CORS permissions
+      // Prepare response with full CORS permissions and edge caching headers
       const responseHeaders = new Headers(upstream.headers);
       responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
       responseHeaders.set('Access-Control-Allow-Headers', '*');
       responseHeaders.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Type');
       responseHeaders.set('Cross-Origin-Resource-Policy', 'cross-origin');
+      responseHeaders.set('Cache-Control', 'public, max-age=86400, s-maxage=86400');
 
       return new Response(upstream.body, {
         status: upstream.status,
