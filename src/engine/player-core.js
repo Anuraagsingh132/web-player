@@ -303,15 +303,40 @@ export class PlayerCore {
           await this.audioEngine.init();
           this.audioEngine.connectMediaElement(this.videoEl, parseInt(channels, 10));
         } else {
-          // Pure in-browser WebCodecs mode for Vercel / Static hosting (0 server bandwidth)
-          this.mode = 'webcodecs';
-          this.isMuxedStream = false;
-          this.videoEl.style.display = 'none';
-          this.canvasEl.style.display = 'block';
-          if (this.onProgress) this.onProgress('Connected in-browser WebCodecs hardware stream.', 85);
+          const isMKV = (fileName && fileName.toLowerCase().endsWith('.mkv')) ||
+                        (probeInfo.formatName && probeInfo.formatName.toLowerCase().includes('matroska'));
+          const isAC3OrDTS = probeInfo.audioTracks.some(t => {
+            const c = (t.codec || '').toLowerCase();
+            return c.includes('ac3') || c.includes('eac3') || c.includes('dts') || c.includes('truehd');
+          });
 
-          this.currentStreamUrl = url;
-          await this.webcodecsStreamer.load(url, fileName);
+          if (!isMKV && !isAC3OrDTS) {
+            // Native HTML5 progressive streaming via CORS Edge Worker (zero server bandwidth)
+            this.mode = 'hybrid';
+            this.isMuxedStream = false;
+            this.seekOffset = 0;
+            this.videoEl.style.display = 'block';
+            this.canvasEl.style.display = 'none';
+            if (this.onProgress) this.onProgress('Connected hardware HTML5 video stream via CORS Edge.', 85);
+
+            this.currentStreamUrl = url;
+            this.videoEl.src = loader.streamUrl;
+            this.videoEl.muted = false;
+            this.videoEl.load();
+
+            await this.audioEngine.init();
+            this.audioEngine.connectMediaElement(this.videoEl, 2);
+          } else {
+            // Pure in-browser WebCodecs mode for MKV & Dolby AC-3 / DTS (0 server bandwidth)
+            this.mode = 'webcodecs';
+            this.isMuxedStream = false;
+            this.videoEl.style.display = 'none';
+            this.canvasEl.style.display = 'block';
+            if (this.onProgress) this.onProgress('Connected in-browser WebCodecs hardware stream.', 85);
+
+            this.currentStreamUrl = url;
+            await this.webcodecsStreamer.load(url, fileName);
+          }
         }
       } else {
         this.mode = 'audio-only';

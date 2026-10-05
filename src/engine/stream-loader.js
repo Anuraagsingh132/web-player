@@ -4,6 +4,8 @@
  * without downloading the entire file into memory.
  */
 
+export const DEFAULT_WORKER_URL = 'https://little-bonus-321e.anuraagsingh10a.workers.dev';
+
 export class RangeStreamLoader {
   constructor(url, options = {}) {
     this.rawUrl = url;
@@ -21,14 +23,17 @@ export class RangeStreamLoader {
   async init() {
     // If it's a remote URL, route through local proxy or Cloudflare Worker to avoid CORS restrictions
     if (this.rawUrl.startsWith('http://') || this.rawUrl.startsWith('https://')) {
-      if (!this.rawUrl.includes('/api/proxy?url=') && !this.rawUrl.includes('corsproxy.io')) {
+      const isAlreadyProxied = this.rawUrl.includes('/api/proxy?url=') ||
+                               this.rawUrl.includes('corsproxy.io') ||
+                               this.rawUrl.includes('workers.dev');
+      if (!isAlreadyProxied) {
         const customWorker = localStorage.getItem('webvlc_cors_worker');
-        if (customWorker) {
-          this.streamUrl = `${customWorker.replace(/\/$/, '')}?url=${encodeURIComponent(this.rawUrl)}`;
-        } else if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        const activeWorker = customWorker || DEFAULT_WORKER_URL;
+
+        if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
           this.streamUrl = `/api/proxy?url=${encodeURIComponent(this.rawUrl)}`;
         } else {
-          this.streamUrl = `https://corsproxy.io/?url=${encodeURIComponent(this.rawUrl)}`;
+          this.streamUrl = `${activeWorker.replace(/\/$/, '')}?url=${encodeURIComponent(this.rawUrl)}`;
         }
       } else {
         this.streamUrl = this.rawUrl;
