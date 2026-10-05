@@ -135,19 +135,63 @@ export class WebCodecsStreamer {
           audioCodecName = await this.libav.avcodec_get_name(this.audioStream.codec_id);
         } catch (e) {}
 
-        const [, c, p, f] = await this.libav.ff_init_decoder(this.audioStream.codec_id, this.audioStream.codecpar);
-        this.audioCodecCtx = c;
-        this.audioPkt = p;
-        this.audioFrame = f;
+        const ch = this.audioStream.channels || 6;
+        const sr = this.audioStream.sample_rate || 48000;
+
+        // Try WebCodecs native AudioDecoder first (hardware accelerated & Dolby compatible)
+        let aConfig = null;
+        try {
+          aConfig = await Bridge.audioStreamToConfig(this.libav, this.audioStream);
+        } catch (e) {}
+
+        if (!aConfig || !aConfig.codec || aConfig.codec === 'unknown') {
+          const cLower = (audioCodecName || '').toLowerCase();
+          if (cLower === 'eac3') aConfig = { codec: 'ec-3', sampleRate: sr, numberOfChannels: ch };
+          else if (cLower === 'ac3') aConfig = { codec: 'ac-3', sampleRate: sr, numberOfChannels: ch };
+          else if (cLower === 'aac') aConfig = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch };
+          else if (cLower === 'opus') aConfig = { codec: 'opus', sampleRate: sr, numberOfChannels: ch };
+          else if (cLower === 'flac') aConfig = { codec: 'flac', sampleRate: sr, numberOfChannels: ch };
+        }
+
+        let audioDecoderSupported = false;
+        if (aConfig && aConfig.codec && typeof AudioDecoder !== 'undefined') {
+          try {
+            const check = await AudioDecoder.isConfigSupported(aConfig);
+            if (check && check.supported) {
+              audioDecoderSupported = true;
+              this.audioDecoder = new AudioDecoder({
+                output: (audioData) => this.scheduleAudioData(audioData),
+                error: (e) => console.warn('[WebCodecsStreamer] AudioDecoder error:', e)
+              });
+              this.audioDecoder.configure(aConfig);
+              console.log('[WebCodecsStreamer] Native AudioDecoder configured successfully:', aConfig.codec);
+            }
+          } catch (e) {
+            // Fall back to software decoder
+          }
+        }
+
+        // Fallback to WASM software decoder if available
+        if (!audioDecoderSupported) {
+          try {
+            const [, c, p, f] = await this.libav.ff_init_decoder(this.audioStream.codec_id, this.audioStream.codecpar);
+            this.audioCodecCtx = c;
+            this.audioPkt = p;
+            this.audioFrame = f;
+            console.log('[WebCodecsStreamer] Software audio decoder initialized for:', audioCodecName);
+          } catch (err) {
+            console.warn('[WebCodecsStreamer] Software audio decoder unavailable for:', audioCodecName);
+          }
+        }
 
         this.metadata.audioTracks.push({
           codec: (audioCodecName || 'Dolby Audio').toUpperCase(),
-          channels: this.audioStream.channels || 6,
-          channelLayout: (this.audioStream.channels === 6) ? '5.1 Surround' : 'Stereo',
-          sampleRate: `${this.audioStream.sample_rate || 48000} Hz`
+          channels: ch,
+          channelLayout: ch === 6 ? '5.1 Surround' : 'Stereo',
+          sampleRate: `${sr} Hz`
         });
       } catch (err) {
-        console.warn('[WebCodecsStreamer] Audio decoder initialization warning:', err);
+        console.warn('[WebCodecsStreamer] Audio initialization error:', err);
       }
     }
 
@@ -227,6 +271,12 @@ export class WebCodecsStreamer {
       const f = this.videoFrameQueue.shift();
       f.close();
     }
+    if (this.videoDecoder && this.videoDecoder.state === 'configured') {
+      try { this.videoDecoder.reset(); } catch (e) {}
+    }
+    if (this.audioDecoder && this.audioDecoder.state === 'configured') {
+      try { this.audioDecoder.reset(); } catch (e) {}
+    }
   }
 
   async startDemuxLoop() {
@@ -235,11 +285,10 @@ export class WebCodecsStreamer {
 
     try {
       while (this.isPlaying && this.fmt_ctx) {
-        // Demux next packets
-        const [res, packets] = await this.libav.ff_read_multi(
+        // Demux next packets using modern ff_read_frame_multi (replaces deprecated ff_read_multi)
+        const [res, packets] = await this.libav.ff_read_frame_multi(
           this.fmt_ctx,
           this.demuxPkt,
-          null,
           { limit: 32 * 1024 }
         );
 
@@ -260,25 +309,37 @@ export class WebCodecsStreamer {
         }
 
         // Process Audio Packets
-        if (this.audioStream && packets[this.audioStream.index] && this.audioCodecCtx) {
-          try {
-            const frames = await this.libav.ff_decode_multi(
-              this.audioCodecCtx,
-              this.audioPkt,
-              this.audioFrame,
-              packets[this.audioStream.index],
-              false
-            );
-
-            for (const f of frames) {
-              this.scheduleAudioFrame(f);
+        if (this.audioStream && packets[this.audioStream.index]) {
+          // Native WebCodecs AudioDecoder
+          if (this.audioDecoder && this.audioDecoder.state === 'configured') {
+            for (const pkt of packets[this.audioStream.index]) {
+              try {
+                const chunk = Bridge.packetToEncodedAudioChunk(pkt, this.audioStream);
+                this.audioDecoder.decode(chunk);
+              } catch (e) {}
             }
-          } catch (e) {
-            console.warn('[WebCodecsStreamer] Audio decode warning:', e);
+          }
+          // Software WASM decoder fallback
+          else if (this.audioCodecCtx) {
+            try {
+              const frames = await this.libav.ff_decode_multi(
+                this.audioCodecCtx,
+                this.audioPkt,
+                this.audioFrame,
+                packets[this.audioStream.index],
+                false
+              );
+
+              for (const f of frames) {
+                this.scheduleAudioFrame(f);
+              }
+            } catch (e) {
+              console.warn('[WebCodecsStreamer] Audio decode warning:', e);
+            }
           }
         }
 
-        // Throttle demux loop if queue is full (buffer 3 seconds ahead)
+        // Throttle demux loop if queue is full (buffer ~60 frames ahead)
         if (this.videoFrameQueue.length > 60) {
           await new Promise(r => setTimeout(r, 200));
         }
@@ -287,6 +348,42 @@ export class WebCodecsStreamer {
       console.error('[WebCodecsStreamer] Demux loop error:', err);
     } finally {
       this.demuxLoopRunning = false;
+    }
+  }
+
+  scheduleAudioData(audioData) {
+    if (!this.audioEngine || !this.audioEngine.ctx) {
+      audioData.close();
+      return;
+    }
+
+    try {
+      const channels = audioData.numberOfChannels;
+      const sampleRate = audioData.sampleRate;
+      const numberOfFrames = audioData.numberOfFrames;
+
+      const buffer = this.audioEngine.ctx.createBuffer(channels, numberOfFrames, sampleRate);
+      for (let ch = 0; ch < channels; ch++) {
+        const dest = new Float32Array(numberOfFrames);
+        audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
+        buffer.copyToChannel(dest, ch);
+      }
+
+      const src = this.audioEngine.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this.audioEngine.masterGain);
+      if (this.audioEngine.splitter) {
+        src.connect(this.audioEngine.splitter);
+      }
+
+      const now = this.audioEngine.ctx.currentTime;
+      const when = Math.max(now, this.audioEngine.nextChunkTime || now);
+      src.start(when);
+      this.audioEngine.nextChunkTime = when + buffer.duration;
+    } catch (err) {
+      console.warn('[WebCodecsStreamer] AudioData scheduling warning:', err);
+    } finally {
+      audioData.close();
     }
   }
 
@@ -335,23 +432,51 @@ export class WebCodecsStreamer {
   }
 
   startRenderLoop() {
-    const render = () => {
+    let lastTime = performance.now();
+    let clock = this.currentTime || 0;
+
+    const render = (now) => {
       if (!this.isPlaying) return;
 
-      if (this.videoFrameQueue.length > 0) {
-        const frame = this.videoFrameQueue.shift();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+      clock += dt;
+
+      // Sync target timestamp with Web Audio or Wall clock
+      let targetTime = clock;
+      if (this.audioEngine && this.audioEngine.ctx && this.audioEngine.nextChunkTime) {
+        targetTime = Math.max(0, this.audioEngine.ctx.currentTime);
+      }
+
+      while (this.videoFrameQueue.length > 0) {
+        const frame = this.videoFrameQueue[0];
+        const frameSec = (frame.timestamp || 0) / 1000000;
+
+        // If frame is in the future (>35ms), wait for next RAF tick
+        if (frameSec > targetTime + 0.035 && this.videoFrameQueue.length < 30) {
+          break;
+        }
+
+        this.videoFrameQueue.shift();
         this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-        this.currentTime = frame.timestamp / 1000000;
+        this.currentTime = frameSec;
         frame.close();
 
         if (this.onTimeUpdate) {
           this.onTimeUpdate(this.currentTime, this.duration);
+        }
+
+        // Render one frame per RAF tick unless catching up
+        if (frameSec >= targetTime - 0.05) {
+          break;
         }
       }
 
       this.renderLoopId = requestAnimationFrame(render);
     };
 
+    lastTime = performance.now();
+    clock = this.currentTime || 0;
     this.renderLoopId = requestAnimationFrame(render);
   }
 }
