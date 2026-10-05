@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebVLC — Universal In-Browser Codec Media Player</title>
+  <!-- Service worker for cross-origin isolation and SharedArrayBuffer -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23f97316' d='M12 2L6 17h12L12 2zm0 4.2L14.6 12H9.4L12 6.2zM4 19l-2 3h20l-2-3H4z'/%3E%3C/svg%3E" />
+  <!-- Service worker for cross-origin isolation and SharedArrayBuffer -->
+  <script src="/coi-serviceworker.js"></script>
+  <link rel="stylesheet" href="/src/index.css" />
+</head>
+<body>
+  <div class="ambient-glow"></div>
+
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">
+          <!-- VLC Cone Icon -->
+          <svg viewBox="0 0 24 24">
+            <path d="M12 2L6 17h12L12 2zm0 4.2L14.6 12H9.4L12 6.2zM4 19l-2 3h20l-2-3H4z"/>
+          </svg>
+        </div>
+        <div class="brand-title">
+          <h1>WebVLC Player</h1>
+          <p>Universal In-Browser Media Engine • MKV, HEVC, AC-3 5.1 & WebCodecs</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <div id="badgeVideoEngine" class="status-badge" title="Active Video Decoder">
+          <span class="badge-dot"></span>
+          <span class="badge-text">GPU Hardware HEVC</span>
+        </div>
+        <div id="badgeAudioEngine" class="status-badge" title="Active Audio Stream Pipeline">
+          <span class="badge-dot"></span>
+          <span class="badge-text">Live Dolby Engine</span>
+        </div>
+        <div id="badgeSurroundEngine" class="status-badge" title="Web Audio Matrix & Downmixer">
+          <span class="badge-dot"></span>
+          <span class="badge-text">Dolby Matrix 5.1</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Player Stage -->
+    <main id="playerStage" class="player-stage">
+      <div id="videoWrapper" class="video-wrapper">
+        <video id="mainVideo" playsinline crossorigin="anonymous" muted></video>
+        <audio id="playerAudio" preload="auto" crossorigin="anonymous"></audio>
+        <canvas id="mainCanvas" style="display: none;"></canvas>
+
+        <!-- Audio Standby Graphic (when playing pure AC-3/DTS/FLAC audio files) -->
+        <div id="audioStandby" class="audio-visual-standby" style="display: none;">
+          <div class="audio-pulse-disc">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="white">
+              <path d="M12 3v9.28a4.39 4.39 0 0 0-1.5-.28 4.5 4.5 0 1 0 4.5 4.5V7h4V3h-7z"/>
+            </svg>
+          </div>
+          <div style="text-align: center;">
+            <h3 style="font-size: 1.1rem; font-weight: 600;">Dolby Multichannel Audio Active</h3>
+            <p style="font-size: 0.8rem; color: #94a3b8;">Decoding AC-3 / Multichannel PCM in WebAssembly</p>
+          </div>
+        </div>
+
+        <!-- Big Center Play Overlay -->
+        <div id="centerPlayBtn" class="center-play-overlay">
+          <svg viewBox="0 0 24 24" width="40" height="40" fill="currentColor">
+            <path d="M8 5v14l11-7z"/>
+          </svg>
+        </div>
+
+        <!-- Subtitle Overlay -->
+        <div id="subtitleOverlay" class="subtitle-overlay" style="display: none;">
+          <span id="subtitlePill" class="subtitle-pill"></span>
+        </div>
+
+        <!-- OSD Overlay -->
+        <div id="osdOverlay" class="osd-overlay"></div>
+
+        <!-- Loading / Buffering Overlay -->
+        <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+          <div class="spinner"></div>
+          <div id="loadingText" class="loading-text">Demuxing Matroska Container...</div>
+          <div class="loading-progress-bar">
+            <div id="loadingProgressFill" class="loading-progress-fill"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls Bar -->
+      <div class="player-controls">
+        <!-- Scrubber -->
+        <div id="progressContainer" class="progress-container">
+          <div class="progress-track">
+            <div id="progressBuffered" class="progress-buffered"></div>
+            <div id="progressPlayed" class="progress-played"></div>
+          </div>
+          <div id="progressThumb" class="progress-thumb"></div>
+          <div id="timeTooltip" class="time-tooltip">00:00</div>
+        </div>
+
+        <!-- Buttons Row -->
+        <div class="controls-row">
+          <div class="controls-left">
+            <button id="playPauseBtn" class="btn-control btn-play-pause" title="Play/Pause (Space)">
+              <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+            </button>
+            <button id="rewindBtn" class="btn-control" title="Back 10s (Left Arrow)">
+              <svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+            </button>
+            <button id="forwardBtn" class="btn-control" title="Forward 10s (Right Arrow)">
+              <svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/></svg>
+            </button>
+            <button id="stopBtn" class="btn-control" title="Stop">
+              <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+            </button>
+            <div id="timeDisplay" class="time-display" title="Click to toggle remaining time">00:00 / 00:00</div>
+          </div>
+
+          <div class="controls-right">
+            <!-- Volume Control -->
+            <div class="volume-group">
+              <button id="volumeBtn" class="btn-control" title="Mute/Unmute (M)">
+                <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+              </button>
+              <input id="volumeSlider" class="volume-slider" type="range" min="0" max="2" step="0.05" value="1" title="Volume (Up to 200% VLC Boost)" />
+              <span id="volumePercent" class="volume-percent">100%</span>
+            </div>
+
+            <!-- Audio Track Selector -->
+            <select id="audioTrackSelect" class="select-control" title="Audio Track (Stream Switcher)">
+              <option value="0">Audio: Default Track</option>
+            </select>
+
+            <!-- Subtitle Selector -->
+            <select id="subtitleTrackSelect" class="select-control" title="Subtitles / Closed Captions">
+              <option value="-1">Subtitles: Off</option>
+              <option value="upload">+ Load External .SRT/.VTT...</option>
+            </select>
+
+            <!-- Downmix Mode Selector -->
+            <select id="downmixSelect" class="select-control" title="Dolby Downmix Matrix">
+              <option value="auto">Downmix: Auto 5.1/Stereo</option>
+              <option value="downmix">Dolby Pro Logic II Downmix</option>
+              <option value="discrete">Discrete 6ch Passthrough</option>
+            </select>
+
+            <!-- Speed Selector -->
+            <select id="speedSelect" class="select-control" title="Playback Speed">
+              <option value="0.5">0.5x</option>
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1.0x</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x</option>
+              <option value="2">2.0x</option>
+            </select>
+
+            <!-- Media Inspector HUD Button -->
+            <button id="inspectorBtn" class="btn-control" title="Media & Codec Inspector (I or C)">
+              <svg viewBox="0 0 24 24"><path d="M11 17h2v-6h-2v6zm1-15C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zM11 9h2V7h-2v2z"/></svg>
+            </button>
+
+            <!-- Picture in Picture -->
+            <button id="pipBtn" class="btn-control" title="Picture-in-Picture">
+              <svg viewBox="0 0 24 24"><path d="M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16.01H3V4.99h18v14.02z"/></svg>
+            </button>
+
+            <!-- Fullscreen -->
+            <button id="fullscreenBtn" class="btn-control" title="Fullscreen (F)">
+              <svg viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 5.1 Surround Sound Real-Time VU Meter -->
+    <section class="vu-meter-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <svg viewBox="0 0 24 24"><path d="M12 3v9.28a4.39 4.39 0 0 0-1.5-.28 4.5 4.5 0 1 0 4.5 4.5V7h4V3h-7z"/></svg>
+          <span>Dolby Digital 5.1 Surround Sound Channel Visualizer (Web Audio API)</span>
+        </div>
+        <span style="font-size: 0.75rem; color: #94a3b8;">Real-Time Multichannel FFT Analysers</span>
+      </div>
+
+      <div class="vu-grid">
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarFL" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">FL</span>
+          <span class="vu-channel-desc">Front Left</span>
+        </div>
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarFR" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">FR</span>
+          <span class="vu-channel-desc">Front Right</span>
+        </div>
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarFC" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">FC</span>
+          <span class="vu-channel-desc">Center Dialogue</span>
+        </div>
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarLFE" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">LFE</span>
+          <span class="vu-channel-desc">Subwoofer Bass</span>
+        </div>
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarSL" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">SL</span>
+          <span class="vu-channel-desc">Surround Left</span>
+        </div>
+        <div class="vu-channel">
+          <div class="vu-bar-bg"><div id="vuBarSR" class="vu-bar-fill"></div></div>
+          <span class="vu-channel-label">SR</span>
+          <span class="vu-channel-desc">Surround Right</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Codec & Stream Inspector Panel (HUD) -->
+    <section id="inspectorPanel" class="inspector-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+          <span>Media Codec & Stream Inspector</span>
+        </div>
+        <span style="font-size: 0.75rem; color: #94a3b8;">Parsed via WebAssembly FFmpeg demuxer</span>
+      </div>
+
+      <div class="inspector-grid">
+        <div class="inspector-card">
+          <div class="card-title">Container & File</div>
+          <div class="card-row"><span class="card-label">File:</span><span id="hudFilename" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Container:</span><span id="hudFormat" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Duration:</span><span id="hudDuration" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Bitrate:</span><span id="hudBitrate" class="card-val">—</span></div>
+        </div>
+
+        <div class="inspector-card">
+          <div class="card-title">Video Stream</div>
+          <div class="card-row"><span class="card-label">Codec:</span><span id="hudVideoCodec" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Resolution:</span><span id="hudResolution" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Frame Rate:</span><span id="hudFps" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Renderer:</span><span id="hudVideoEngine" class="card-val">—</span></div>
+        </div>
+
+        <div class="inspector-card">
+          <div class="card-title">Audio Stream</div>
+          <div class="card-row"><span class="card-label">Codec:</span><span id="hudAudioCodec" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Channels:</span><span id="hudAudioChannels" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Sample Rate:</span><span id="hudSampleRate" class="card-val">—</span></div>
+          <div class="card-row"><span class="card-label">Pipeline:</span><span id="hudAudioEngine" class="card-val">—</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Source Input Section -->
+    <section class="input-section">
+      <!-- Drag & Drop Zone -->
+      <div id="dropzone" class="dropzone-card">
+        <div class="dropzone-icon">
+          <svg viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+        </div>
+        <h3 style="font-size: 1rem; font-weight: 600; margin-bottom: 4px;">Drop MKV, MP4, AC3, FLAC, or Media Here</h3>
+        <p style="font-size: 0.8rem; color: #94a3b8;">Decoded entirely 100% client-side in browser — no upload to any server</p>
+        <button id="browseFileBtn" class="btn-file-select" type="button">Browse Local File</button>
+      </div>
+      <input id="fileInput" type="file" accept="*/*" style="display: none;" />
+      <input id="subtitleFileInput" type="file" accept=".srt,.vtt" style="display: none;" />
+
+      <!-- Direct URL Input -->
+      <div class="url-card">
+        <div class="dropzone-icon" style="background: rgba(56, 189, 248, 0.1);">
+          <svg viewBox="0 0 24 24" style="fill: var(--accent-cyan);"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+        </div>
+        <h3 style="font-size: 1rem; font-weight: 600; margin-bottom: 4px;">Stream Direct Media URL</h3>
+        <p style="font-size: 0.8rem; color: #94a3b8;">Enter any direct video/audio HTTP URL (supports Range requests)</p>
+        <div class="url-input-group">
+          <input id="urlInput" class="url-input" type="url" placeholder="https://example.com/video.mkv" />
+          <button id="streamUrlBtn" class="btn-stream" type="button">Stream URL</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 1-Click Quick Load Presets -->
+    <section class="presets-section">
+      <div class="presets-header">
+        <div class="presets-title">⚡ Instant Test Presets (1-Click Playback)</div>
+        <span style="font-size: 0.75rem; color: #94a3b8;">Pre-configured samples to test codecs immediately</span>
+      </div>
+
+      <div class="presets-grid">
+        <div class="preset-chip" data-sample-url="/samples/sample_test1.mkv" data-sample-name="test1.mkv">
+          <span>🚀 Matroska MKV (test1.mkv)</span>
+          <span class="chip-tag">MKV / H.264</span>
+        </div>
+
+        <div class="preset-chip" data-sample-url="/samples/sample_test5.mkv" data-sample-name="test5.mkv">
+          <span>🚀 Multi-Track MKV with Subs</span>
+          <span class="chip-tag">MKV / Multi-audio</span>
+        </div>
+
+        <div class="preset-chip" data-sample-url="/samples/sample_surroundTest.ac3" data-sample-name="Dolby_Digital_5.1.ac3">
+          <span>🚀 Authentic Dolby AC-3 5.1</span>
+          <span class="chip-tag">AC-3 / 6 Channels</span>
+        </div>
+
+        <div class="preset-chip" data-sample-url="/samples/surround_5.1_test.wav" data-sample-name="surround_5.1_test.wav">
+          <span>🚀 5.1 Channel Surround Tone Sweep</span>
+          <span class="chip-tag">FL, FR, FC, LFE, SL, SR</span>
+        </div>
+
+        <div class="preset-chip" data-sample-url="/samples/sample_splash.mp4" data-sample-name="Splash.mp4">
+          <span>🚀 High-Def MP4 Video</span>
+          <span class="chip-tag">MP4 / AAC</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
