@@ -65,12 +65,21 @@ export class WebCodecsStreamer {
     const info = await this.loader.init();
     this.totalSize = info.totalSize || 0;
 
+    // Start high-bandwidth 30s-1min forward buffer preload
+    this.loader.startForwardBuffer(0);
+    this.loader.onBufferUpdate = (stats) => {
+      if (this.onBufferedUpdate) {
+        this.onBufferedUpdate(stats);
+      }
+    };
+
     await this.initLibAV();
 
     // Setup virtual block device with HTTP Range requests
     const devName = 'stream_input_' + Date.now();
     this.libav.onblockread = async (name, pos, length) => {
       try {
+        this.loader.updatePlaybackPosition(pos);
         const readLen = Math.min(length || 64 * 1024, (this.totalSize ? this.totalSize - pos : 128 * 1024));
         const bytes = await this.loader.readRange(pos, pos + readLen - 1);
         await this.libav.ff_block_reader_dev_send(name, pos, bytes);
@@ -446,8 +455,13 @@ export class WebCodecsStreamer {
     const render = (now) => {
       if (!this.isPlaying) return;
 
-      const elapsedSec = (now - this.playbackStartWallTime) / 1000;
-      const targetTime = (this.playbackStartMediaTime || 0) + elapsedSec;
+      if (this.videoFrameQueue.length === 0) {
+        // Buffering/Waiting: anchor timeline to avoid clock drift
+        this.playbackStartWallTime = now;
+        this.playbackStartMediaTime = this.currentTime || 0;
+        this.renderLoopId = requestAnimationFrame(render);
+        return;
+      }
 
       while (this.videoFrameQueue.length > 0) {
         const frame = this.videoFrameQueue[0];

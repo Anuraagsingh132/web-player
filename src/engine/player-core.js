@@ -55,6 +55,7 @@ export class PlayerCore {
     this.onMetadataLoaded = null;
     this.onProgress = null;
     this.onError = null;
+    this.onBufferedUpdate = null;
 
     this.setupVideoListeners();
   }
@@ -335,6 +336,11 @@ export class PlayerCore {
             if (this.onProgress) this.onProgress('Connected in-browser WebCodecs hardware stream.', 85);
 
             this.currentStreamUrl = url;
+            this.webcodecsStreamer.onBufferedUpdate = (stats) => {
+              if (this.onBufferedUpdate) {
+                this.onBufferedUpdate(stats);
+              }
+            };
             await this.webcodecsStreamer.load(url, fileName);
           }
         }

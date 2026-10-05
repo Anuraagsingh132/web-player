@@ -108,6 +108,11 @@ export class PlayerUI {
     this.core.onProgress = (msg, pct) => this.handleProgress(msg, pct);
     this.core.onError = (err) => this.handleError(err);
     this.core.onWarning = (msg) => this.showToast(msg, 'warning');
+    this.core.onBufferedUpdate = (stats) => {
+      if (this.dom.progressBuffered && stats && stats.bufferedEndRatio !== undefined) {
+        this.dom.progressBuffered.style.width = `${Math.min(100, Math.max(0, stats.bufferedEndRatio * 100))}%`;
+      }
+    };
 
     // Play/Pause / Stop
     this.dom.playPauseBtn.addEventListener('click', () => this.togglePlayPause());

@@ -15,11 +15,16 @@ export class RangeStreamLoader {
     this.contentType = '';
     this.streamUrl = '';
     
-    // High-performance 2MB block buffer for full bandwidth saturation
-    this.blockSize = 2 * 1024 * 1024; // 2 MB blocks
-    this.blockCache = new Map();
-    this.inFlightRequests = new Map();
-    this.maxCachedBlocks = 24; // ~48 MB sliding window
+    // High-speed block engine (30s to 1 min forward preload)
+    this.blockSize = 2 * 1024 * 1024; // 2 MB per block
+    this.targetAheadBlocks = 25; // 50 MB preload ahead (~30 to 45 seconds of 4K video)
+    this.maxCachedBlocks = 50; // ~100 MB RAM sliding window
+    this.blockCache = new Map(); // blockIndex -> Uint8Array
+    this.inFlightRequests = new Map(); // blockIndex -> Promise<Uint8Array>
+
+    this.currentPlaybackByte = 0;
+    this.isForwardBuffering = false;
+    this.onBufferUpdate = null;
   }
 
   /**
@@ -92,6 +97,78 @@ export class RangeStreamLoader {
   }
 
   /**
+   * Starts aggressive forward buffering to preload 30s–1min of video at full bandwidth
+   */
+  startForwardBuffer(startByte = 0) {
+    this.currentPlaybackByte = startByte;
+    if (this.isForwardBuffering) return;
+    this.isForwardBuffering = true;
+    this.runForwardBufferLoop();
+  }
+
+  stopForwardBuffer() {
+    this.isForwardBuffering = false;
+  }
+
+  updatePlaybackPosition(currentByte) {
+    this.currentPlaybackByte = Math.max(0, currentByte);
+  }
+
+  async runForwardBufferLoop() {
+    while (this.isForwardBuffering) {
+      const currentBlock = Math.floor(this.currentPlaybackByte / this.blockSize);
+      const targetBlock = currentBlock + this.targetAheadBlocks;
+      const totalBlocks = this.totalSize > 0 ? Math.ceil(this.totalSize / this.blockSize) : targetBlock + 1;
+
+      // Find the next block that is missing in our forward window
+      let nextBlockToFetch = -1;
+      for (let b = currentBlock; b <= Math.min(targetBlock, totalBlocks - 1); b++) {
+        if (!this.blockCache.has(b) && !this.inFlightRequests.has(b)) {
+          nextBlockToFetch = b;
+          break;
+        }
+      }
+
+      if (nextBlockToFetch !== -1) {
+        try {
+          await this.fetchBlock(nextBlockToFetch);
+          if (this.onBufferUpdate) {
+            this.onBufferUpdate(this.getBufferedStats(currentBlock));
+          }
+        } catch (err) {
+          console.warn('[RangeStreamLoader] Forward buffer error for block', nextBlockToFetch, err.message);
+          await new Promise(r => setTimeout(r, 400));
+        }
+      } else {
+        // Buffer ahead target is fully satisfied! Sleep briefly and monitor playback
+        if (this.onBufferUpdate) {
+          this.onBufferUpdate(this.getBufferedStats(currentBlock));
+        }
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  }
+
+  getBufferedStats(currentBlock = null) {
+    const cb = currentBlock !== null ? currentBlock : Math.floor(this.currentPlaybackByte / this.blockSize);
+    let contiguousAhead = 0;
+    while (this.blockCache.has(cb + contiguousAhead)) {
+      contiguousAhead++;
+    }
+    const bufferedBytes = contiguousAhead * this.blockSize;
+    const estSecAhead = Math.round(bufferedBytes / 2100000); // ~2.1 MB/s for 16.8 Mbps 4K
+    const bufferedEndByte = (cb + contiguousAhead) * this.blockSize;
+    const bufferedEndRatio = this.totalSize > 0 ? Math.min(1, bufferedEndByte / this.totalSize) : 0;
+
+    return {
+      bufferedAheadBlocks: contiguousAhead,
+      bufferedAheadSec: estSecAhead,
+      bufferedEndRatio,
+      totalBufferedMB: Math.round((this.blockCache.size * this.blockSize) / (1024 * 1024))
+    };
+  }
+
+  /**
    * Fetches an aligned 2MB block from the network or memory cache
    */
   async fetchBlock(blockIndex) {
@@ -126,10 +203,20 @@ export class RangeStreamLoader {
         const buffer = await res.arrayBuffer();
         const data = new Uint8Array(buffer);
 
-        // Manage sliding window memory buffer (max 24 blocks = 48MB)
+        // Manage sliding window memory buffer (evict blocks older than currentBlock - 4)
         if (this.blockCache.size >= this.maxCachedBlocks) {
-          const oldestKey = this.blockCache.keys().next().value;
-          this.blockCache.delete(oldestKey);
+          const currentBlock = Math.floor(this.currentPlaybackByte / this.blockSize);
+          for (const key of this.blockCache.keys()) {
+            if (key < currentBlock - 4) {
+              this.blockCache.delete(key);
+              break;
+            }
+          }
+          // If still over capacity, delete oldest key
+          if (this.blockCache.size >= this.maxCachedBlocks) {
+            const oldestKey = this.blockCache.keys().next().value;
+            this.blockCache.delete(oldestKey);
+          }
         }
 
         this.blockCache.set(blockIndex, data);
@@ -144,17 +231,7 @@ export class RangeStreamLoader {
   }
 
   /**
-   * Asynchronously prefetches upcoming blocks in the background
-   */
-  prefetch(blockIndex) {
-    if (this.totalSize > 0 && blockIndex * this.blockSize >= this.totalSize) return;
-    if (this.blockCache.has(blockIndex) || this.inFlightRequests.has(blockIndex)) return;
-    if (this.inFlightRequests.size >= 2) return; // Keep maximum 2 concurrent requests
-    this.fetchBlock(blockIndex).catch(() => {});
-  }
-
-  /**
-   * Fast byte range read from memory block cache with automatic prefetching
+   * Fast byte range read from memory block cache
    */
   async readRange(start, end) {
     const totalBytesNeeded = Math.max(0, end - start + 1);
@@ -164,8 +241,7 @@ export class RangeStreamLoader {
     const startBlock = Math.floor(start / this.blockSize);
     const endBlock = Math.floor(end / this.blockSize);
 
-    // Smoothly prefetch the next block ahead
-    this.prefetch(endBlock + 1);
+    this.updatePlaybackPosition(start);
 
     for (let b = startBlock; b <= endBlock; b++) {
       const blockData = await this.fetchBlock(b);
