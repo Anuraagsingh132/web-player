@@ -1,6 +1,21 @@
 import LibAV from 'libav.js';
 import * as Bridge from 'libavjs-webcodecs-bridge';
 import { RangeStreamLoader } from './stream-loader.js';
+import { registerAc3Decoder } from '@mediabunny/ac3';
+import { registerDtsDecoder } from '@mediabunny/dts';
+import { InputAudioTrack, AudioSampleSink, EncodedPacket } from 'mediabunny';
+
+// Register AC-3 (Dolby Digital / Plus) and DTS custom WASM decoders
+try {
+  registerAc3Decoder();
+} catch (e) {
+  console.warn('[WebCodecsStreamer] Note on AC-3 decoder registration:', e);
+}
+try {
+  registerDtsDecoder();
+} catch (e) {
+  console.warn('[WebCodecsStreamer] Note on DTS decoder registration:', e);
+}
 
 /**
  * Real-Time WebCodecs + Web Audio API MKV Streaming Engine
@@ -21,6 +36,7 @@ export class WebCodecsStreamer {
     this.audioStream = null;
     this.videoDecoder = null;
     this.audioDecoder = null;
+    this.customAudioDecoder = null;
 
     // Software audio decoder fallback for Dolby AC-3/E-AC-3
     this.audioCodecCtx = null;
@@ -180,14 +196,44 @@ export class WebCodecsStreamer {
           }
         }
 
-        // Fallback to WASM software decoder if available
+        // Fallback 1: High-Performance WASM audio decoder (AC-3, E-AC-3, DTS)
+        if (!audioDecoderSupported) {
+          try {
+            const cLower = (audioCodecName || '').toLowerCase();
+            const mbCodec = (cLower.includes('eac3') || cLower.includes('ec-3')) ? 'eac3'
+              : (cLower.includes('ac3') || cLower.includes('ac-3')) ? 'ac3'
+              : (cLower.includes('dts') || cLower.includes('dca')) ? 'dts'
+              : cLower;
+
+            const fakeTrack = Object.create(InputAudioTrack.prototype);
+            fakeTrack.canDecode = async () => true;
+            fakeTrack.getCodec = async () => mbCodec;
+            fakeTrack.getDecoderConfig = async () => ({
+              codec: mbCodec,
+              sampleRate: sr,
+              numberOfChannels: ch
+            });
+
+            const sink = new AudioSampleSink(fakeTrack);
+            this.customAudioDecoder = await sink._createDecoder(
+              (sample) => this.scheduleAudioData(sample),
+              (err) => console.warn('[WebCodecsStreamer] Custom audio decoder error:', err)
+            );
+            console.log('[WebCodecsStreamer] High-performance WASM audio decoder initialized for:', mbCodec);
+            audioDecoderSupported = true;
+          } catch (err) {
+            console.warn('[WebCodecsStreamer] Custom WASM audio decoder initialization failed:', err);
+          }
+        }
+
+        // Fallback 2: LibAV software decoder if available
         if (!audioDecoderSupported) {
           try {
             const [, c, p, f] = await this.libav.ff_init_decoder(this.audioStream.codec_id, this.audioStream.codecpar);
             this.audioCodecCtx = c;
             this.audioPkt = p;
             this.audioFrame = f;
-            console.log('[WebCodecsStreamer] Software audio decoder initialized for:', audioCodecName);
+            console.log('[WebCodecsStreamer] LibAV software audio decoder initialized for:', audioCodecName);
           } catch (err) {
             console.warn('[WebCodecsStreamer] Software audio decoder unavailable for:', audioCodecName);
           }
@@ -260,9 +306,15 @@ export class WebCodecsStreamer {
 
   play() {
     if (this.isPlaying) return;
+    if (this.audioEngine && this.audioEngine.ctx && this.audioEngine.ctx.state === 'suspended') {
+      try { this.audioEngine.ctx.resume(); } catch (e) {}
+    }
     this.isPlaying = true;
     this.playbackStartWallTime = performance.now();
     this.playbackStartMediaTime = this.currentTime || 0;
+    if (this.audioEngine) {
+      this.audioEngine.nextChunkTime = this.audioEngine.ctx ? this.audioEngine.ctx.currentTime : 0;
+    }
     if (this.onStateChange) this.onStateChange('playing');
 
     this.startDemuxLoop();
@@ -274,6 +326,9 @@ export class WebCodecsStreamer {
     if (this.playbackStartWallTime) {
       const elapsed = (performance.now() - this.playbackStartWallTime) / 1000;
       this.playbackStartMediaTime += elapsed;
+    }
+    if (this.audioEngine) {
+      this.audioEngine.nextChunkTime = 0;
     }
     if (this.onStateChange) this.onStateChange('paused');
     if (this.renderLoopId) cancelAnimationFrame(this.renderLoopId);
@@ -293,6 +348,12 @@ export class WebCodecsStreamer {
     }
     if (this.audioDecoder && this.audioDecoder.state === 'configured') {
       try { this.audioDecoder.reset(); } catch (e) {}
+    }
+    if (this.customAudioDecoder) {
+      try { this.customAudioDecoder.flush(); } catch (e) {}
+    }
+    if (this.audioEngine) {
+      this.audioEngine.nextChunkTime = 0;
     }
   }
 
@@ -336,7 +397,29 @@ export class WebCodecsStreamer {
               } catch (e) {}
             }
           }
-          // Software WASM decoder fallback
+          // High-Performance WASM Audio Decoder (AC-3 / E-AC-3 / DTS)
+          else if (this.customAudioDecoder) {
+            for (const pkt of packets[this.audioStream.index]) {
+              try {
+                const tbNum = this.audioStream.time_base_num || 1;
+                const tbDen = this.audioStream.time_base_den || 1000;
+                const ptsRaw = (pkt.ptshi || 0) * 0x100000000 + (pkt.pts || 0);
+                const ptsSec = (ptsRaw * tbNum) / tbDen;
+                const durSec = ((pkt.duration || 0) * tbNum) / tbDen;
+
+                const encPacket = new EncodedPacket(
+                  pkt.data instanceof Uint8Array ? pkt.data : new Uint8Array(pkt.data),
+                  'key',
+                  ptsSec,
+                  durSec > 0 ? durSec : 0.032
+                );
+                this.customAudioDecoder.decode(encPacket);
+              } catch (e) {
+                console.warn('[WebCodecsStreamer] Custom audio packet decode warning:', e);
+              }
+            }
+          }
+          // Software WASM decoder fallback via LibAV
           else if (this.audioCodecCtx) {
             try {
               const frames = await this.libav.ff_decode_multi(
@@ -373,7 +456,7 @@ export class WebCodecsStreamer {
 
   scheduleAudioData(audioData) {
     if (!this.audioEngine || !this.audioEngine.ctx) {
-      audioData.close();
+      if (audioData && typeof audioData.close === 'function') audioData.close();
       return;
     }
 
@@ -382,11 +465,16 @@ export class WebCodecsStreamer {
       const sampleRate = audioData.sampleRate;
       const numberOfFrames = audioData.numberOfFrames;
 
-      const buffer = this.audioEngine.ctx.createBuffer(channels, numberOfFrames, sampleRate);
+      let buffer = this.audioEngine.ctx.createBuffer(channels, numberOfFrames, sampleRate);
       for (let ch = 0; ch < channels; ch++) {
         const dest = new Float32Array(numberOfFrames);
         audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
         buffer.copyToChannel(dest, ch);
+      }
+
+      // If user has stereo hardware (< 6 channels) and stream has 6+ channels, apply Dolby Pro Logic II downmixing
+      if (channels >= 6 && this.audioEngine.ctx.destination.maxChannelCount < 6) {
+        buffer = this.audioEngine.applyDolbyDownmix(buffer);
       }
 
       const src = this.audioEngine.ctx.createBufferSource();
@@ -397,13 +485,16 @@ export class WebCodecsStreamer {
       }
 
       const now = this.audioEngine.ctx.currentTime;
-      const when = Math.max(now, this.audioEngine.nextChunkTime || now);
+      let when = this.audioEngine.nextChunkTime;
+      if (!when || when < now || (when - now > 1.0)) {
+        when = now + 0.05;
+      }
       src.start(when);
       this.audioEngine.nextChunkTime = when + buffer.duration;
     } catch (err) {
       console.warn('[WebCodecsStreamer] AudioData scheduling warning:', err);
     } finally {
-      audioData.close();
+      if (audioData && typeof audioData.close === 'function') audioData.close();
     }
   }
 
